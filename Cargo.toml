@@ -1,0 +1,34 @@
+[package]
+name = "dslocal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.9" }
+gpui-component = "0.7.3"
+# No Xcode/metal toolchain on this machine: use runtime shader compilation
+# instead of the build script shelling out to `xcrun metal`.
+# font-kit: REQUIRED for real CoreText text rendering (without it gpui uses a
+# stub text system that reports no fonts and rasterizes no glyphs).
+# runtime_shaders: this machine has no Xcode metal compiler.
+gpui-pre-apple = { version = "=0.3.9", features = ["font-kit", "runtime_shaders"] }
+# gpui_macos gates its CoreText text system behind ITS OWN font-kit feature
+# (platform.rs warns "compiled without the font-kit feature, so no text will be rendered").
+gpui-pre-macos = { version = "=0.3.9", features = ["font-kit"] }
+raw-window-handle = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSURL", "NSURLRequest", "NSString", "NSGeometry", "NSThread", "NSArray"] }
+# NSOpenPanel is what webView:runOpenPanelWithParameters:initiatedByFrame:
+# completionHandler: must show for the page's <input type=file>. Without that
+# delegate method WebKit behaves as if the user pressed Cancel, so the attach
+# button in the page looks dead.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSView", "NSResponder", "NSWindow", "NSApplication", "NSImage", "NSEvent", "NSGraphicsContext", "NSOpenPanel", "NSSavePanel", "NSPasteboard", "block2"] }
+block2 = "0.6"
+objc2-core-foundation = "0.3.2"
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-app-kit", "objc2-core-foundation", "block2", "WKWebView", "WKWebViewConfiguration", "WKNavigation", "WKUIDelegate", "WKOpenPanelParameters", "WKFrameInfo", "WKUserScript", "WKUserContentController"] }
