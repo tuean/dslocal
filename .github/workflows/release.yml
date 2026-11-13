@@ -14,7 +14,7 @@ env:
 jobs:
   macos:
     name: macOS (universal .dmg + .zip)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -67,7 +67,11 @@ jobs:
         run: cargo test --manifest-path windows/Cargo.toml
 
       - name: Install NSIS
-        run: choco install nsis -y --no-progress
+        run: |
+          choco install nsis -y --no-progress
+          $nsis = "C:\Program Files (x86)\NSIS"
+          if (Test-Path $nsis) { $nsis | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8 }
+          Get-Command makensis -ErrorAction SilentlyContinue
 
       - name: Package
         run: |
@@ -93,4 +97,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag --title "DeepSeek Local $tag" --generate-notes --verify-tag
           }
-          gh release upload $tag (Get-ChildItem dist -Include *.exe, *.zip -File | ForEach-Object FullName) --clobber
+          Get-ChildItem dist\*.exe, dist\*.zip | ForEach-Object {
+            gh release upload $tag $_.FullName --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed for $($_.Name)" }
+          }
