@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Builds dist/DSLocal.app from the cargo binary plus assets/icon.icns.
-# Usage: scripts/bundle.sh [--debug]
+# Usage: scripts/bundle.sh [--debug|--release]
+#
+# Environment overrides (used by scripts/package-macos.sh):
+#   DSLOCAL_TARGET   cargo --target triple (e.g. x86_64-apple-darwin)
+#   DSLOCAL_APP_DIR  where the .app bundle is written
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,7 +16,8 @@ PROFILE="release"
 PROFILE_FLAG="--release"
 
 DIST_DIR="$ROOT_DIR/dist"
-APP_DIR="$DIST_DIR/$APP_NAME.app"
+APP_DIR="${DSLOCAL_APP_DIR:-$DIST_DIR/$APP_NAME.app}"
+TARGET="${DSLOCAL_TARGET:-}"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
@@ -56,14 +61,17 @@ if [ ! -f "$ICON_SRC" ]; then
     exit 1
 fi
 
-echo "[bundle] profile: $PROFILE"
+echo "[bundle] profile: $PROFILE${TARGET:+ target: $TARGET}"
+BUILD_ARGS=()
 if [ -n "$PROFILE_FLAG" ]; then
-    cargo build "$PROFILE_FLAG"
-else
-    cargo build
+    BUILD_ARGS+=("$PROFILE_FLAG")
 fi
+if [ -n "$TARGET" ]; then
+    BUILD_ARGS+=(--target "$TARGET")
+fi
+cargo build "${BUILD_ARGS[@]}"
 
-BIN_SRC="$ROOT_DIR/target/$PROFILE/$BIN_NAME"
+BIN_SRC="$ROOT_DIR/target/${TARGET:+$TARGET/}$PROFILE/$BIN_NAME"
 if [ ! -x "$BIN_SRC" ]; then
     echo "[bundle] missing binary: $BIN_SRC" >&2
     exit 1

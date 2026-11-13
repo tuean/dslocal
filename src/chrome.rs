@@ -20,6 +20,46 @@ mod export;
 
 pub const TOOLBAR_HEIGHT: f32 = 44.0;
 pub const HOME_URL: &str = "https://chat.deepseek.com";
+/// The local tdsearch service (project ~/RustroverProjects/tdsearch): a local
+/// web search + AI summary UI served by axum on 8787.
+pub const SEARCH_URL: &str = "http://127.0.0.1:8787";
+
+/// The two pages the toolbar switches between. Both stay loaded, so switching
+/// never loses a chat draft or a search result list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Chat,
+    Search,
+}
+
+impl Tab {
+    /// DSLOCAL_TAB=search opens the local search page first (also the entry
+    /// point for the tab regression probe).
+    fn from_env() -> Self {
+        match std::env::var("DSLOCAL_TAB").as_deref() {
+            Ok("search") => Tab::Search,
+            _ => Tab::Chat,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Chat => "chat",
+            Tab::Search => "search",
+        }
+    }
+}
+
+/// The chat page; DSLOCAL_URL overrides it for tests.
+fn chat_url() -> String {
+    std::env::var("DSLOCAL_URL").unwrap_or_else(|_| HOME_URL.to_string())
+}
+
+/// The search page can be pointed elsewhere for testing; the service address is
+/// fixed by tdsearch's own TDSEARCH_ADDR.
+fn search_url() -> String {
+    std::env::var("DSLOCAL_SEARCH_URL").unwrap_or_else(|_| SEARCH_URL.to_string())
+}
 
 /// Left inset that keeps the traffic lights clear of the first button. The
 /// lights start at x = 12 and span ~68pt including their 8pt gutters.
@@ -38,7 +78,9 @@ actions!([
     ZoomReset,
     ToggleAlwaysOnTop,
     ExportConversation,
-    SwitchIcon
+    SwitchIcon,
+    ShowChatTab,
+    ShowSearchTab
 ]);
 
 /// Icon variants shipped with the app; the toolbar button cycles them.
@@ -59,11 +101,19 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-0", ZoomReset, None),
         KeyBinding::new("cmd-t", ToggleAlwaysOnTop, None),
         KeyBinding::new("cmd-s", ExportConversation, None),
+        // Browser-style tab shortcuts. cmd-1 / cmd-2 also work while the page
+        // has focus, because keyroute dispatches through the window keymap.
+        KeyBinding::new("cmd-1", ShowChatTab, None),
+        KeyBinding::new("cmd-2", ShowSearchTab, None),
     ]
 }
 
 pub struct DsLocalApp {
-    webview: Option<WebView>,
+    chat: Option<WebView>,
+    /// Created on the first switch to the search tab, so an unused tab costs no
+    /// WebKit process and no request to the local service.
+    search: Option<WebView>,
+    tab: Tab,
     error: Option<String>,
     state: State,
     /// Set on mouse down, consumed on the first mouse move: waiting for the
@@ -87,12 +137,15 @@ pub struct DsLocalApp {
     icon_test_scheduled: bool,
     probe_scheduled: bool,
     panel_test_scheduled: bool,
+    tab_test_scheduled: bool,
 }
 
 impl DsLocalApp {
     pub fn new(state: State, cx: &mut Context<Self>) -> Self {
         Self {
-            webview: None,
+            chat: None,
+            search: None,
+            tab: Tab::from_env(),
             error: None,
             state,
             focus_handle: cx.focus_handle(),
@@ -110,25 +163,105 @@ impl DsLocalApp {
             icon_test_scheduled: false,
             probe_scheduled: false,
             panel_test_scheduled: false,
+            tab_test_scheduled: false,
         }
     }
 
     /// Creation needs the native window handle, so it happens on first render.
-    fn ensure_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.webview.is_some() || self.error.is_some() {
-            return;
+    fn ensure_webviews(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat.is_none() && self.error.is_none() {
+            let url = chat_url();
+            eprintln!("[webview] chat url = {url}");
+            match WebView::new(window, TOOLBAR_HEIGHT, &url) {
+                Ok(view) => {
+                    view.set_zoom(self.state.zoom);
+                    view.set_hidden(self.tab != Tab::Chat);
+                    eprintln!("[webview] attached, zoom {:.0}%", self.state.zoom * 100.0);
+                    self.chat = Some(view);
+                }
+                Err(err) => {
+                    self.error = Some(format!("{err:#}"));
+                    return;
+                }
+            }
+            self.schedule_resize_test(window, cx);
         }
-        let url = std::env::var("DSLOCAL_URL").unwrap_or_else(|_| HOME_URL.to_string());
-        eprintln!("[webview] url = {url}");
+        if self.tab == Tab::Search {
+            self.ensure_search(window);
+        }
+    }
+
+    /// Lazily builds the tdsearch page. A failure is reported in the status
+    /// line but never blocks the chat tab.
+    fn ensure_search(&mut self, window: &mut Window) -> bool {
+        if self.search.is_some() {
+            return true;
+        }
+        let url = search_url();
+        eprintln!("[webview] search url = {url}");
         match WebView::new(window, TOOLBAR_HEIGHT, &url) {
             Ok(view) => {
                 view.set_zoom(self.state.zoom);
-                eprintln!("[webview] attached, zoom {:.0}%", self.state.zoom * 100.0);
-                self.webview = Some(view);
+                view.set_hidden(self.tab != Tab::Search);
+                eprintln!("[webview] search attached (local tds)");
+                self.search = Some(view);
+                true
             }
-            Err(err) => self.error = Some(format!("{err:#}")),
+            Err(err) => {
+                eprintln!("[webview] search failed: {err:#}");
+                self.status_message = Some(format!("本地搜索打开失败: {err:#}"));
+                false
+            }
         }
-        self.schedule_resize_test(window, cx);
+    }
+
+    fn active(&self) -> Option<&WebView> {
+        match self.tab {
+            Tab::Chat => self.chat.as_ref(),
+            Tab::Search => self.search.as_ref(),
+        }
+    }
+
+    /// Shows exactly one of the two stacked pages. setHidden is skipped when the
+    /// state already matches, so a redundant switch does not relayout WebKit.
+    fn apply_visibility(&self) {
+        for (view, visible) in [
+            (self.chat.as_ref(), self.tab == Tab::Chat),
+            (self.search.as_ref(), self.tab == Tab::Search),
+        ] {
+            if let Some(view) = view
+                && view.is_hidden() == visible
+            {
+                view.set_hidden(!visible);
+            }
+        }
+    }
+
+    fn switch_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == tab {
+            return;
+        }
+        if tab == Tab::Search && !self.ensure_search(window) {
+            cx.notify();
+            return;
+        }
+        self.tab = tab;
+        // A stale "已导出 ..." label would describe the other page.
+        self.status_message = None;
+        self.apply_visibility();
+        // Hand the keyboard to the page being shown; otherwise the hidden view
+        // keeps first responder and typing goes nowhere visible.
+        if let Some(view) = self.active() {
+            view.focus();
+        }
+        let focused = window_ext::focused_webview(window).is_some();
+        eprintln!(
+            "[tabs] active = {}, chat hidden = {:?}, search hidden = {:?}, page focused = {focused}",
+            tab.label(),
+            self.chat.as_ref().map(WebView::is_hidden),
+            self.search.as_ref().map(WebView::is_hidden),
+        );
+        cx.notify();
     }
 
     /// Evidence hook: DSLOCAL_RESIZE_TEST=1 shrinks the window once, which
@@ -233,23 +366,34 @@ impl DsLocalApp {
         if let Some(message) = &self.status_message {
             return message.clone();
         }
-        match (&self.webview, &self.error) {
-            (_, Some(err)) => format!("webview error: {err}"),
-            (Some(_), None) => format!("WKWebView -> {HOME_URL}"),
-            (None, None) => "attaching WKWebView...".to_string(),
+        if let Some(err) = &self.error {
+            return format!("webview error: {err}");
+        }
+        let (name, url) = match self.tab {
+            Tab::Chat => ("对话", chat_url()),
+            Tab::Search => ("搜索", search_url()),
+        };
+        if self.active().is_some() {
+            format!("{name} · {url}")
+        } else {
+            format!("正在挂载{name}页…")
         }
     }
 
     fn zoom(&self) -> f64 {
-        self.webview
-            .as_ref()
+        self.active()
             .map(WebView::zoom)
             .unwrap_or(self.state.zoom)
     }
 
     fn set_zoom(&mut self, zoom: f64, cx: &mut Context<Self>) {
         let zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        if let Some(view) = &self.webview {
+        // Keep both pages at one zoom: switching tabs should not change text
+        // size, and the hidden page would otherwise snap back on next show.
+        if let Some(view) = &self.chat {
+            view.set_zoom(zoom);
+        }
+        if let Some(view) = &self.search {
             view.set_zoom(zoom);
         }
         self.state.zoom = zoom;
@@ -311,24 +455,24 @@ impl DsLocalApp {
     }
 
     fn reload(&mut self) {
-        if let Some(view) = &self.webview {
+        if let Some(view) = self.active() {
             view.reload();
         }
-        eprintln!("[key] cmd-r reload");
+        eprintln!("[key] cmd-r reload ({})", self.tab.label());
     }
 
     fn go_back(&mut self) {
-        if let Some(view) = &self.webview {
+        if let Some(view) = self.active() {
             view.go_back();
         }
-        eprintln!("[key] cmd-[ back");
+        eprintln!("[key] cmd-[ back ({})", self.tab.label());
     }
 
     fn go_forward(&mut self) {
-        if let Some(view) = &self.webview {
+        if let Some(view) = self.active() {
             view.go_forward();
         }
-        eprintln!("[key] cmd-] forward");
+        eprintln!("[key] cmd-] forward ({})", self.tab.label());
     }
 
     /// Read-only scrape of the page, Markdown assembly and the file write. Both
@@ -339,7 +483,15 @@ impl DsLocalApp {
             eprintln!("[export] already running, trigger ignored");
             return;
         }
-        let Some(view) = self.webview.as_ref() else {
+        // The scrapers only understand the chat transcript, so exporting from
+        // the search tab would produce an empty or nonsense file.
+        if self.tab != Tab::Chat {
+            self.status_message = Some("导出只在「对话」页可用".to_string());
+            eprintln!("[export] rejected: active tab is {}", self.tab.label());
+            cx.notify();
+            return;
+        }
+        let Some(view) = self.chat.as_ref() else {
             self.status_message = Some("导出失败: WKWebView 未就绪".to_string());
             eprintln!("[export] no webview yet");
             cx.notify();
@@ -428,8 +580,7 @@ impl DsLocalApp {
             for _ in 0..120 {
                 let loading = this
                     .update(cx, |this, _cx| {
-                        this.webview
-                            .as_ref()
+                        this.active()
                             .map(WebView::is_loading)
                             .unwrap_or(false)
                     })
@@ -443,14 +594,52 @@ impl DsLocalApp {
             }
             cx.background_executor().timer(Duration::from_secs(3)).await;
             let _ = this.update(cx, |this, _cx| {
-                if let Some(view) = &this.webview {
-                    view.evaluate_javascript(&script, |result| match result {
-                        Ok(value) => eprintln!("[probe] {value}"),
+                let tab = this.tab.label();
+                if let Some(view) = this.active() {
+                    view.evaluate_javascript(&script, move |result| match result {
+                        Ok(value) => eprintln!("[probe] tab={tab} {value}"),
                         Err(err) => eprintln!("[probe] error {err}"),
                     });
                 }
             });
             cx.background_executor().timer(Duration::from_secs(3)).await;
+            let _ = cx.update(|_window, cx| cx.quit());
+        })
+        .detach();
+    }
+
+    /// Evidence hook: DSLOCAL_TAB_TEST=1 waits for the chat page, then sends
+    /// cmd-2 and cmd-1 through the real keymap, reporting after each what is
+    /// visible and what the active page says its title is.
+    fn schedule_tab_test(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.tab_test_scheduled || std::env::var("DSLOCAL_TAB_TEST").is_err() {
+            return;
+        }
+        self.tab_test_scheduled = true;
+        cx.spawn_in(window, async move |this, cx| {
+            for step in ["cmd-2", "cmd-1"] {
+                cx.background_executor().timer(Duration::from_secs(6)).await;
+                let _ = cx.update(|window, cx| match gpui::Keystroke::parse(step) {
+                    Ok(keystroke) => {
+                        let handled = window.dispatch_keystroke(keystroke, cx);
+                        eprintln!("[tabs] tab test: {step} handled = {handled}");
+                    }
+                    Err(err) => eprintln!("[tabs] tab test: {step} parse error {err}"),
+                });
+                cx.background_executor().timer(Duration::from_secs(4)).await;
+                let _ = this.update(cx, |this, _cx| {
+                    eprintln!(
+                        "[tabs] tab test after {step}: active = {}",
+                        this.tab.label()
+                    );
+                    if let Some(view) = this.active() {
+                        view.evaluate_javascript("document.title", |result| {
+                            eprintln!("[tabs] tab test page title = {result:?}");
+                        });
+                    }
+                });
+            }
+            cx.background_executor().timer(Duration::from_secs(2)).await;
             let _ = cx.update(|_window, cx| cx.quit());
         })
         .detach();
@@ -468,7 +657,7 @@ impl DsLocalApp {
             for _ in 0..120 {
                 let loading = this
                     .update(cx, |this, _cx| {
-                        this.webview
+                        this.chat
                             .as_ref()
                             .map(WebView::is_loading)
                             .unwrap_or(false)
@@ -515,21 +704,27 @@ impl DsLocalApp {
 
 impl Render for DsLocalApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_webview(window, cx);
+        self.ensure_webviews(window, cx);
         self.start_persistence(window, cx);
         self.schedule_selftest(window, cx);
         self.schedule_export_test(window, cx);
         self.schedule_probe_test(window, cx);
+        self.schedule_tab_test(window, cx);
         self.schedule_panel_test(window, cx);
         self.schedule_icon_test(window, cx);
-        if let Some(view) = &self.webview {
+        // Both pages track the window, including the hidden one: it is only
+        // revealed on a tab switch, so a stale frame would flash.
+        if let Some(view) = &self.chat {
+            view.sync_frame();
+        }
+        if let Some(view) = &self.search {
             view.sync_frame();
         }
         let size = window.bounds().size;
         let size = (f32::from(size.width), f32::from(size.height));
         if self.last_size != Some(size) {
             self.last_size = Some(size);
-            let frame = self.webview.as_ref().map(|view| {
+            let frame = self.active().map(|view| {
                 let frame = view.native_view().frame();
                 (
                     frame.origin.x,
@@ -623,6 +818,23 @@ impl Render for DsLocalApp {
             )
             .child(div().w(px(8.0)))
             .child(
+                Button::new("tab_chat".to_string())
+                    .label("对话")
+                    .selected(self.tab == Tab::Chat)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.switch_tab(Tab::Chat, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("tab_search".to_string())
+                    .label("搜索")
+                    .selected(self.tab == Tab::Search)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.switch_tab(Tab::Search, window, cx)
+                    })),
+            )
+            .child(div().w(px(8.0)))
+            .child(
                 Button::new("zoom_out".to_string())
                     .label("缩小")
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -693,6 +905,12 @@ impl Render for DsLocalApp {
             }))
             .on_action(cx.listener(|this, _: &ExportConversation, window, cx| {
                 this.export_conversation(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowChatTab, window, cx| {
+                this.switch_tab(Tab::Chat, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowSearchTab, window, cx| {
+                this.switch_tab(Tab::Search, window, cx)
             }))
             .child(toolbar)
             .child(div().flex_1().w_full())

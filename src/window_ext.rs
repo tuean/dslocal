@@ -130,7 +130,9 @@ pub fn apply_dock_icon(variant: &str) {
 }
 
 /// The WKWebView gpui does not know about: it is an AppKit subview added by
-/// webview.rs, so it is found by walking the window's view tree.
+/// webview.rs, so it is found by walking the window's view tree. With two tabs
+/// both webviews live in that tree, so hidden ones are skipped: the visible one
+/// is the page the user is looking at.
 pub fn find_webview(window: &Window) -> Option<Retained<WKWebView>> {
     let native = ns_window(window)?;
     let content = native.contentView()?;
@@ -138,6 +140,9 @@ pub fn find_webview(window: &Window) -> Option<Retained<WKWebView>> {
 }
 
 fn find_webview_in(view: &NSView) -> Option<Retained<WKWebView>> {
+    if view.isHidden() {
+        return None;
+    }
     if view.isKindOfClass(WKWebView::class()) {
         // SAFETY: the class check above guarantees the type; the window owns it.
         return unsafe { Retained::retain(view as *const NSView as *mut WKWebView) };
@@ -148,6 +153,22 @@ fn find_webview_in(view: &NSView) -> Option<Retained<WKWebView>> {
         }
     }
     None
+}
+
+/// The webview that owns the keyboard right now. Editing commands (cmd-C/V/...)
+/// must go to the focused page; with two tabs "the first WKWebView found" may be
+/// the hidden one.
+pub fn focused_webview(window: &Window) -> Option<Retained<WKWebView>> {
+    let native = ns_window(window)?;
+    let responder = native.firstResponder()?;
+    if !responder.isKindOfClass(WKWebView::class()) {
+        return None;
+    }
+    // SAFETY: the class check above guarantees the type; the window retains it.
+    unsafe {
+        let ptr = Retained::as_ptr(&responder) as *const NSView as *mut WKWebView;
+        Retained::retain(ptr)
+    }
 }
 
 /// Reproduces what a click into the page does: the webview takes first
@@ -163,22 +184,6 @@ pub fn focus_webview(window: &Window) -> Option<String> {
         .map(|responder| responder.class().name().to_string_lossy().into_owned());
     eprintln!("[keys] makeFirstResponder(WKWebView) accepted = {accepted}, first responder = {class:?}");
     class
-}
-
-/// True when the page owns the keyboard. Editing commands (cmd-C/V/X/A/Z) only
-/// belong to WebKit in that case; a focused gpui input keeps them for itself.
-pub fn webview_owns_focus(window: &Window) -> bool {
-    let Some(native) = ns_window(window) else {
-        return false;
-    };
-    let Some(responder) = native.firstResponder() else {
-        return false;
-    };
-    let Some(class) = objc2::runtime::AnyClass::get(c"WKWebView") else {
-        return false;
-    };
-    // SAFETY: both objects are live on the main thread for this call.
-    unsafe { objc2::msg_send![&*responder, isKindOfClass: class] }
 }
 
 pub fn webview_is_loading(window: &Window) -> Option<bool> {

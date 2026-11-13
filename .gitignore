@@ -1,4 +1,6 @@
 /target
 /artifacts
+/dist
+/windows/target
 .DS_Store
 *.log

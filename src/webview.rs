@@ -18,7 +18,7 @@ use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{Encode, Encoding, MainThreadMarker, MainThreadOnly, msg_send};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSModalPanelWindowLevel, NSModalResponseOK, NSOpenPanel,
-    NSView,
+    NSResponder, NSView,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSArray, NSString, NSURL, NSURLRequest};
@@ -171,6 +171,44 @@ const IME_GUARD_JS: &str = r#"
 })();
 "#;
 
+/// Runs in every page before its own scripts. Arrow keys must move the caret,
+/// but with a Chinese input method in front of the page the function-key
+/// character leaks through as text: after a candidate is committed, Squirrel
+/// (RIME) hands WebKit `insertText` with a C0 control character on every press
+/// of left/right, so the message box slowly fills with invisible junk and the
+/// caret never moves. The characters blocked here can never be part of a real
+/// message, so cancelling the edit is safe.
+const KEY_JUNK_GUARD_JS: &str = r#"
+(() => {
+  if (window.__dslocalKeyGuard) return;
+  window.__dslocalKeyGuard = true;
+  const stats = { blocked: 0, samples: [] };
+  window.__dslocalKeyGuardStats = stats;
+  const junk = (data) => {
+    if (!data) return false;
+    for (const ch of data) {
+      const cp = ch.codePointAt(0);
+      // Function keys (arrows, home/end) arrive as U+F700.. in the PUA.
+      if (cp >= 0xf700 && cp <= 0xf8ff) return true;
+      // C0 controls, minus the three that are real text.
+      if (cp < 0x20 && cp !== 0x09 && cp !== 0x0a && cp !== 0x0d) return true;
+      if (cp === 0x7f) return true;
+    }
+    return false;
+  };
+  window.addEventListener('beforeinput', (event) => {
+    if (event.inputType !== 'insertText') return;
+    if (!junk(event.data)) return;
+    stats.blocked += 1;
+    if (stats.samples.length < 8) {
+      stats.samples.push(Array.from(event.data, (c) => c.codePointAt(0).toString(16)).join(' '));
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+})();
+"#;
+
 pub struct WebView {
     view: Retained<WKWebView>,
     /// WKWebView holds its UIDelegate weakly, so the picker delegate has to be
@@ -197,8 +235,17 @@ impl WebView {
                 false,
             )
         };
+        let key_guard = unsafe {
+            WKUserScript::initWithSource_injectionTime_forMainFrameOnly(
+                WKUserScript::alloc(mtm),
+                &NSString::from_str(KEY_JUNK_GUARD_JS),
+                WKUserScriptInjectionTime::AtDocumentStart,
+                false,
+            )
+        };
         unsafe {
             controller.addUserScript(&script);
+            controller.addUserScript(&key_guard);
             configuration.setUserContentController(&controller);
         }
         let view = unsafe {
@@ -242,6 +289,28 @@ impl WebView {
 
     pub fn go_forward(&self) {
         unsafe { self.view.goForward() };
+    }
+
+    /// Two tabs keep two live webviews stacked in the same frame; the inactive
+    /// one is hidden rather than removed, so its page state (chat draft, search
+    /// results) survives a tab switch.
+    pub fn set_hidden(&self, hidden: bool) {
+        self.view.setHidden(hidden);
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.view.isHidden()
+    }
+
+    /// Hands the keyboard to this page. Switching tabs goes through here:
+    /// otherwise the hidden view can stay first responder and every keystroke
+    /// lands in the wrong page.
+    pub fn focus(&self) {
+        let Some(window) = self.view.window() else {
+            return;
+        };
+        let responder: &NSResponder = &self.view;
+        window.makeFirstResponder(Some(responder));
     }
 
     /// Page zoom, 1.0 == 100%.

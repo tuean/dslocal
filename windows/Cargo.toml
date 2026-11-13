@@ -1,0 +1,23 @@
+[package]
+name = "dslocal-windows"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "DeepSeek chat (chat.deepseek.com) in a native Windows window, powered by WebView2"
+license = "MIT"
+
+[[bin]]
+name = "dslocal"
+path = "src/main.rs"
+
+[dependencies]
+tao = "0.37.2"
+# devtools: Ctrl+Shift+I / F12 open the WebView2 dev tools.
+wry = { version = "0.57.2", features = ["devtools"] }
+# Decodes assets/icon.png into the window icon at startup.
+png = "0.17"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

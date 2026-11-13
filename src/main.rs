@@ -1,3 +1,4 @@
+mod arrowprobe;
 mod chrome;
 mod hotkey;
 mod keyroute;
@@ -76,6 +77,7 @@ fn open_main_window(cx: &mut App) {
             keyroute::install(cx, window);
             keyroute::schedule_selftest(cx);
             pasteprobe::schedule(cx, window);
+            arrowprobe::schedule(cx, window);
             if let Some(native) = window_ext::ns_window(window) {
                 hotkey::install(native);
             } else {

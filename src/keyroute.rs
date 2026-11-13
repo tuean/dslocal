@@ -156,10 +156,9 @@ fn forward_editing_command(window: &Window, keystroke: &Keystroke) -> bool {
     let Some(command) = editing(keystroke) else {
         return false;
     };
-    if !crate::window_ext::webview_owns_focus(window) {
-        return false;
-    }
-    let Some(webview) = crate::window_ext::find_webview(window) else {
+    // Send it to the page that owns the keyboard: with two tabs open, the
+    // first webview in the tree may be the hidden one.
+    let Some(webview) = crate::window_ext::focused_webview(window) else {
         return false;
     };
     // SAFETY: main thread, live webview, standard NSResponder editing actions.
